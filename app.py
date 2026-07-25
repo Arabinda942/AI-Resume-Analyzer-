@@ -29,6 +29,8 @@ Edit STUDY_TIPS to change what advice is shown for a given missing skill.
 import os
 import re
 import math
+import logging
+import time
 from collections import defaultdict
 
 from flask import Flask, request, render_template_string
@@ -41,6 +43,18 @@ from sklearn.metrics.pairwise import cosine_similarity
 import pypdf
 import docx
 
+# ----------------------------------------------------------------------
+# LOGGING
+# Configured explicitly (not just relying on Flask/gunicorn defaults) so
+# that on Render — or any host — the SBERT import/load status shows up
+# unmistakably in the deploy logs instead of being silent or buried.
+# ----------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("resume_analyzer")
+
 # Sentence-BERT is optional: it's a heavy dependency (pulls in torch), so the
 # app must keep working with lexical-only scoring if it isn't installed or
 # fails to load (e.g. on a memory-constrained host). Everything below checks
@@ -49,8 +63,21 @@ try:
     from sentence_transformers import SentenceTransformer
     import numpy as np
     SBERT_IMPORT_OK = True
-except ImportError:
+    logger.info(
+        "[SBERT] Import OK — 'sentence_transformers' is installed. "
+        "Model '%s' will be lazy-loaded on first analysis request.",
+        "all-MiniLM-L6-v2",
+    )
+except ImportError as e:
     SBERT_IMPORT_OK = False
+    logger.warning(
+        "[SBERT] Import FAILED — 'sentence_transformers' is not installed or "
+        "could not be imported (%s). The app will run in LEXICAL + TF-IDF "
+        "fallback mode only. If this is unexpected: confirm "
+        "'sentence-transformers' is listed in requirements.txt, and check the "
+        "Render build log to see whether it (and torch) actually installed.",
+        e,
+    )
 
 # ----------------------------------------------------------------------
 # CONFIG
@@ -378,15 +405,52 @@ def tfidf_similarity_score(cv_text, role_text):
 def get_sbert_model():
     """Lazy-load the SBERT model once per worker process. Returns None (and
     stops retrying) if it can't be loaded, so the rest of the app falls back
-    to lexical-only scoring instead of crashing."""
+    to lexical-only scoring instead of crashing.
+
+    Every branch logs clearly so Render (or any host's) logs make the
+    live status obvious without needing to run a full analysis:
+      - import missing            -> logged once at startup (see above)
+      - already failed this run   -> logged once, then silently returns None
+      - loading now (first call)  -> logged before + after, with duration
+      - already loaded            -> silent (hot path, called per request)
+    """
     global _sbert_model, _sbert_load_failed
-    if not SBERT_IMPORT_OK or _sbert_load_failed:
+
+    if not SBERT_IMPORT_OK:
         return None
+
+    if _sbert_load_failed:
+        # Already tried and failed earlier in this process's lifetime —
+        # don't spam the logs on every request, just stay in fallback mode.
+        return None
+
     if _sbert_model is None:
+        logger.info(
+            "[SBERT] Loading model '%s' for the first time in this worker "
+            "(downloads ~90MB from Hugging Face if not cached) ...",
+            SBERT_MODEL_NAME,
+        )
+        start = time.time()
         try:
             _sbert_model = SentenceTransformer(SBERT_MODEL_NAME)
+            elapsed = time.time() - start
+            logger.info(
+                "[SBERT] Model '%s' loaded successfully in %.1fs — "
+                "semantic scoring is ACTIVE for this worker.",
+                SBERT_MODEL_NAME, elapsed,
+            )
         except Exception:
+            elapsed = time.time() - start
             _sbert_load_failed = True
+            logger.exception(
+                "[SBERT] Model load FAILED after %.1fs — falling back to "
+                "LEXICAL + TF-IDF scoring only for the rest of this worker's "
+                "life. Common causes on hosted free tiers: out-of-memory "
+                "(OOM) kill during download/load, no network access to "
+                "Hugging Face, or disk space limits. See the traceback above "
+                "for the exact error.",
+                elapsed,
+            )
             return None
     return _sbert_model
 
@@ -1296,6 +1360,10 @@ def analyze():
     results, health, cv_embedding = analyze_resume(cv_text)
     cv_text_clean = clean_text(cv_text)
     sbert_active = cv_embedding is not None
+    logger.info(
+        "[SBERT] /analyze request scored with %s mode.",
+        "SEMANTIC (lexical + TF-IDF + SBERT)" if sbert_active else "FALLBACK (lexical + TF-IDF only)",
+    )
 
     jd_analysis = analyze_jd(cv_text_clean, jd_raw_text, cv_embedding) if jd_raw_text else None
     roadmap = build_roadmap(results, jd_analysis)
