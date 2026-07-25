@@ -4,4 +4,15 @@ python-docx==1.1.2
 scikit-learn==1.5.0
 Werkzeug==3.0.3
 gunicorn==22.0.0
+
+# --- Sentence-BERT (optional; app falls back to lexical+TF-IDF if this
+# section is removed or fails to install/load) ---
+# CPU-only PyTorch build: pulling from the default PyPI index installs the
+# full GPU build (torch itself ~500MB, plus several GB of NVIDIA CUDA/cuDNN/
+# NCCL/Triton packages that a CPU-only Render instance never uses). That
+# bloats the build to multiple GB and can slow container startup enough to
+# trip Render's port-scan timeout before gunicorn even binds the port.
+# This extra index provides a much smaller CPU-only wheel with none of that.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 sentence-transformers==2.7.0
