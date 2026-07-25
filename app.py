@@ -55,29 +55,73 @@ logging.basicConfig(
 )
 logger = logging.getLogger("resume_analyzer")
 
-# Sentence-BERT is optional: it's a heavy dependency (pulls in torch), so the
-# app must keep working with lexical-only scoring if it isn't installed or
-# fails to load (e.g. on a memory-constrained host). Everything below checks
-# SBERT_IMPORT_OK / get_sbert_model() before using it.
-try:
-    from sentence_transformers import SentenceTransformer
-    import numpy as np
-    SBERT_IMPORT_OK = True
-    logger.info(
-        "[SBERT] Import OK — 'sentence_transformers' is installed. "
-        "Model '%s' will be lazy-loaded on first analysis request.",
-        "all-MiniLM-L6-v2",
-    )
-except ImportError as e:
+# Sentence-BERT is optional: it's a heavy dependency (pulls in PyTorch).
+# IMPORTANT: the import itself (not just loading the model) can use a lot of
+# memory the moment 'sentence_transformers' is imported, because it pulls in
+# torch as a side effect. Importing it at module load time — i.e. the instant
+# gunicorn boots the app — can be enough to OOM-kill the worker on a
+# memory-constrained host (e.g. Render's free tier, ~512MB) *before the app
+# ever serves a single request*, which shows up to visitors as a permanent
+# 502 with nothing informative in the logs.
+#
+# To avoid that, the import is deliberately deferred: it only happens inside
+# get_sbert_model(), on the first request that actually needs semantic
+# scoring. Until then, SBERT_IMPORT_OK is None ("not yet attempted"), the app
+# boots on lexical + TF-IDF alone, and Render sees a healthy, live process.
+#
+# Set the DISABLE_SBERT environment variable to "1" (or "true") on Render to
+# skip SBERT entirely and guarantee it never even attempts to import — the
+# fastest way to confirm/rule out SBERT as the cause of a boot crash, with no
+# code or requirements.txt changes needed.
+SBERT_MODEL_NAME = "all-MiniLM-L6-v2"
+SBERT_DISABLED_BY_ENV = os.environ.get("DISABLE_SBERT", "").strip().lower() in ("1", "true", "yes")
+SBERT_IMPORT_OK = None  # None = not yet attempted, True/False once attempted
+SentenceTransformer = None
+np = None
+
+if SBERT_DISABLED_BY_ENV:
     SBERT_IMPORT_OK = False
     logger.warning(
-        "[SBERT] Import FAILED — 'sentence_transformers' is not installed or "
-        "could not be imported (%s). The app will run in LEXICAL + TF-IDF "
-        "fallback mode only. If this is unexpected: confirm "
-        "'sentence-transformers' is listed in requirements.txt, and check the "
-        "Render build log to see whether it (and torch) actually installed.",
-        e,
+        "[SBERT] Disabled via DISABLE_SBERT environment variable — skipping "
+        "import entirely. Running in LEXICAL + TF-IDF mode only. Remove or "
+        "unset DISABLE_SBERT to re-enable semantic scoring."
     )
+else:
+    logger.info(
+        "[SBERT] Import deferred until first request that needs it (keeps "
+        "boot-time memory low). Set DISABLE_SBERT=1 to skip it entirely."
+    )
+
+
+def _ensure_sbert_import():
+    """Attempt the (heavy) sentence-transformers/torch import exactly once,
+    on first use. Safe to call repeatedly — no-ops after the first attempt,
+    whether it succeeded or failed."""
+    global SentenceTransformer, np, SBERT_IMPORT_OK
+    if SBERT_IMPORT_OK is not None:
+        return SBERT_IMPORT_OK
+    try:
+        from sentence_transformers import SentenceTransformer as _SentenceTransformer
+        import numpy as _np
+        SentenceTransformer = _SentenceTransformer
+        np = _np
+        SBERT_IMPORT_OK = True
+        logger.info(
+            "[SBERT] Import OK — 'sentence_transformers' is installed. "
+            "Model '%s' will now be loaded.",
+            SBERT_MODEL_NAME,
+        )
+    except ImportError as e:
+        SBERT_IMPORT_OK = False
+        logger.warning(
+            "[SBERT] Import FAILED — 'sentence_transformers' is not installed or "
+            "could not be imported (%s). The app will run in LEXICAL + TF-IDF "
+            "fallback mode only. If this is unexpected: confirm "
+            "'sentence-transformers' is listed in requirements.txt, and check the "
+            "Render build log to see whether it (and torch) actually installed.",
+            e,
+        )
+    return SBERT_IMPORT_OK
 
 # ----------------------------------------------------------------------
 # CONFIG
@@ -99,7 +143,6 @@ HERO_CIRC = round(2 * math.pi * HERO_R, 2)
 # Sentence-BERT — used as a zero-shot semantic matcher (no fine-tuning, no
 # labeled training data: just embedding cosine similarity). Small model so it
 # stays usable on a CPU-only, low-RAM host. Loaded lazily on first use.
-SBERT_MODEL_NAME = "all-MiniLM-L6-v2"
 _sbert_model = None
 _sbert_load_failed = False
 _role_embedding_cache = {}
@@ -416,7 +459,7 @@ def get_sbert_model():
     """
     global _sbert_model, _sbert_load_failed
 
-    if not SBERT_IMPORT_OK:
+    if not _ensure_sbert_import():
         return None
 
     if _sbert_load_failed:
