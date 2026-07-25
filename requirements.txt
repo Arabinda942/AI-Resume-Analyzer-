@@ -5,14 +5,16 @@ scikit-learn==1.5.0
 Werkzeug==3.0.3
 gunicorn==22.0.0
 
-# --- Sentence-BERT (optional; app falls back to lexical+TF-IDF if this
-# section is removed or fails to install/load) ---
-# CPU-only PyTorch build: pulling from the default PyPI index installs the
-# full GPU build (torch itself ~500MB, plus several GB of NVIDIA CUDA/cuDNN/
-# NCCL/Triton packages that a CPU-only Render instance never uses). That
-# bloats the build to multiple GB and can slow container startup enough to
-# trip Render's port-scan timeout before gunicorn even binds the port.
-# This extra index provides a much smaller CPU-only wheel with none of that.
+# --- Sentence-BERT (OPTIONAL — currently disabled) ---
+# Disabled for this deployment: confirmed via Render logs that this instance
+# does not have enough memory to load PyTorch + sentence-transformers, even
+# the CPU-only build — every attempt was OOM-killed (SIGKILL) mid-load. This
+# is a hard memory ceiling on the current instance, not a code bug, so the
+# reliable fix is to not attempt loading it here at all. The app already has
+# a complete lexical + TF-IDF fallback and works fully without this section.
+#
+# To re-enable (e.g. after upgrading to a Render plan with more RAM), remove
+# the leading '#' from the three lines below and redeploy:
 # --extra-index-url https://download.pytorch.org/whl/cpu
 # torch
 # sentence-transformers==2.7.0
