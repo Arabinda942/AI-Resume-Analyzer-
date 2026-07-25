@@ -1410,22 +1410,59 @@ def analyze():
         "SEMANTIC (lexical + TF-IDF + SBERT)" if sbert_active else "FALLBACK (lexical + TF-IDF only)",
     )
 
-    jd_analysis = analyze_jd(cv_text_clean, jd_raw_text, cv_embedding) if jd_raw_text else None
-    roadmap = build_roadmap(results, jd_analysis)
-    radar = build_radar(results)
+    # Everything from here on (JD comparison, roadmap, radar geometry, and
+    # the final template render) is wrapped in a broad try/except. This is
+    # deliberately generic ("except Exception") because the goal isn't to
+    # handle any specific failure mode gracefully — it's to guarantee that
+    # if *anything* unexpected goes wrong (a bad edge case in scoring, a
+    # memory error partway through SBERT encoding, a template rendering
+    # issue), the visitor sees a normal, friendly error page instead of a
+    # raw 500, and the FULL traceback lands in the logs so it can actually
+    # be diagnosed instead of just showing "Internal Server Error" with no
+    # further information.
+    try:
+        jd_analysis = analyze_jd(cv_text_clean, jd_raw_text, cv_embedding) if jd_raw_text else None
+        roadmap = build_roadmap(results, jd_analysis)
+        radar = build_radar(results)
 
+        return render_template_string(
+            RESULT_PAGE,
+            results=results,
+            roadmap=roadmap,
+            health=health,
+            jd=jd_analysis,
+            radar=radar,
+            sbert_active=sbert_active,
+            sbert_model=SBERT_MODEL_NAME,
+            hero_circ=HERO_CIRC,
+            card_circ=CARD_CIRC,
+        )
+    except Exception:
+        logger.exception(
+            "[analyze] Unhandled error while scoring/rendering the report. "
+            "Falling back to a friendly error page instead of a raw 500. "
+            "See the traceback above for the exact cause."
+        )
+        return render_template_string(
+            UPLOAD_PAGE,
+            error="Something went wrong while generating your report. Please try again — "
+                  "if this keeps happening, try a shorter CV or a plain .txt file.",
+            roles=roles,
+        )
+
+
+@app.errorhandler(500)
+def handle_internal_error(e):
+    """Last-resort safety net for any error that escapes the /analyze try/except
+    above (e.g. an error in the index page, or something outside a route
+    entirely). Logs the full traceback and shows a friendly page instead of
+    the bare 'Internal Server Error' text."""
+    logger.exception("[errorhandler] Unhandled 500 error reached the top-level handler.")
     return render_template_string(
-        RESULT_PAGE,
-        results=results,
-        roadmap=roadmap,
-        health=health,
-        jd=jd_analysis,
-        radar=radar,
-        sbert_active=sbert_active,
-        sbert_model=SBERT_MODEL_NAME,
-        hero_circ=HERO_CIRC,
-        card_circ=CARD_CIRC,
-    )
+        UPLOAD_PAGE,
+        error="Something went wrong on our end. Please try again in a moment.",
+        roles=list(ROLE_PROFILES.keys()),
+    ), 500
 
 
 if __name__ == "__main__":
