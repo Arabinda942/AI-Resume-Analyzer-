@@ -13,6 +13,6 @@ gunicorn==22.0.0
 # bloats the build to multiple GB and can slow container startup enough to
 # trip Render's port-scan timeout before gunicorn even binds the port.
 # This extra index provides a much smaller CPU-only wheel with none of that.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-sentence-transformers==2.7.0
+# --extra-index-url https://download.pytorch.org/whl/cpu
+# torch
+# sentence-transformers==2.7.0
