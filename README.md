@@ -46,6 +46,16 @@ Then open **http://127.0.0.1:5000**.
 
 - Start command: `gunicorn app:app`
 - `sentence-transformers` pulls in PyTorch, which is a heavy dependency. On a memory-constrained free tier, the model may fail to download or load — if that happens, the app keeps working in lexical + TF-IDF mode automatically. If you'd rather not carry the extra weight at all, remove `sentence-transformers` from `requirements.txt`; no code changes needed.
+- **Importing `sentence-transformers` is deferred until the first request that needs it** (not done at boot). This keeps the process's startup memory low and avoids a common failure mode: the import itself pulling in torch at boot can be enough to get the worker OOM-killed on a 512MB free tier *before it ever serves a request*, which shows up as a permanent `502 Bad Gateway` with no useful error in the logs.
+- **`DISABLE_SBERT` environment variable** — set this to `1` (or `true`) in Render's dashboard (Environment tab) to skip SBERT/torch entirely, with zero code changes. This is the fastest way to rule SBERT in or out as the cause of a boot crash or 502: set it, redeploy, and if the app comes up healthy, SBERT/memory was the problem.
+
+### Troubleshooting a 502 Bad Gateway on Render
+
+1. Open Render → your service → **Logs**, and look at the **most recent deploy**, not an old one.
+2. If the log ends abruptly with no Python traceback (just stops, or shows something like the process exiting) — that's the signature of an **OOM kill**. The OS kills the process before Python gets a chance to log anything.
+3. Quick fix to confirm: set `DISABLE_SBERT=1` under Environment, save, and let it redeploy. If the 502 goes away, the cause was memory pressure from loading `sentence-transformers`/torch — you can leave `DISABLE_SBERT` on permanently, or upgrade to a paid instance with more RAM to keep semantic scoring.
+4. If you see `bash: line 1: gunicorn: command not found` in the build log, `gunicorn` is missing from `requirements.txt` (it's included here as `gunicorn==22.0.0`) or the start command is misconfigured — it must be exactly `gunicorn app:app`.
+5. If the deploy log shows the build succeeding but the app still 502s after a minute or more, check whether a request is timing out — the first request that triggers an SBERT model download can take a while; gunicorn's default worker timeout (30s) can be too short for that. Add a longer timeout to the start command if needed, e.g. `gunicorn app:app --timeout 120`.
 
 ### Verifying SBERT status from the logs (no analysis needed)
 
