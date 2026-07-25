@@ -41,6 +41,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 import pypdf
 import docx
 
+# Sentence-BERT is optional: it's a heavy dependency (pulls in torch), so the
+# app must keep working with lexical-only scoring if it isn't installed or
+# fails to load (e.g. on a memory-constrained host). Everything below checks
+# SBERT_IMPORT_OK / get_sbert_model() before using it.
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    SBERT_IMPORT_OK = True
+except ImportError:
+    SBERT_IMPORT_OK = False
+
 # ----------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------
@@ -57,6 +68,14 @@ CARD_R = 46
 CARD_CIRC = round(2 * math.pi * CARD_R, 2)
 HERO_R = 90
 HERO_CIRC = round(2 * math.pi * HERO_R, 2)
+
+# Sentence-BERT — used as a zero-shot semantic matcher (no fine-tuning, no
+# labeled training data: just embedding cosine similarity). Small model so it
+# stays usable on a CPU-only, low-RAM host. Loaded lazily on first use.
+SBERT_MODEL_NAME = "all-MiniLM-L6-v2"
+_sbert_model = None
+_sbert_load_failed = False
+_role_embedding_cache = {}
 
 # Radar chart geometry
 RADAR_SIZE = 380
@@ -356,6 +375,63 @@ def tfidf_similarity_score(cv_text, role_text):
         return 0.0
 
 
+def get_sbert_model():
+    """Lazy-load the SBERT model once per worker process. Returns None (and
+    stops retrying) if it can't be loaded, so the rest of the app falls back
+    to lexical-only scoring instead of crashing."""
+    global _sbert_model, _sbert_load_failed
+    if not SBERT_IMPORT_OK or _sbert_load_failed:
+        return None
+    if _sbert_model is None:
+        try:
+            _sbert_model = SentenceTransformer(SBERT_MODEL_NAME)
+        except Exception:
+            _sbert_load_failed = True
+            return None
+    return _sbert_model
+
+
+def sbert_embed(text):
+    """Encode a single piece of text to a normalized embedding, or None if
+    the model isn't available. Text is capped since MiniLM only attends to
+    ~256 tokens anyway — encoding more just costs time for no extra signal."""
+    model = get_sbert_model()
+    if model is None or not text.strip():
+        return None
+    try:
+        return model.encode(text[:4000], normalize_embeddings=True)
+    except Exception:
+        return None
+
+
+def sbert_role_embedding(role_name, role_text):
+    """Cached embedding for a role profile's keyword text — static per run,
+    so we only encode each role once instead of once per uploaded CV."""
+    if role_name not in _role_embedding_cache:
+        _role_embedding_cache[role_name] = sbert_embed(role_text)
+    return _role_embedding_cache[role_name]
+
+
+def sbert_similarity(embedding_a, embedding_b):
+    """Cosine similarity between two pre-normalized embeddings, as a 0-100
+    score. This is the 'zero-shot' half of the match: no keywords, no
+    training on resumes — just semantic closeness of meaning."""
+    if embedding_a is None or embedding_b is None:
+        return None
+    sim = float(np.dot(embedding_a, embedding_b))
+    return round(max(sim, 0.0) * 100, 2)
+
+
+def blend_scores(kw_score, tfidf_score, sbert_score):
+    """Combine lexical keyword coverage, TF-IDF statistical overlap, and
+    SBERT semantic similarity into one final score. SBERT gets the largest
+    weight when available since it catches paraphrased/synonym matches that
+    pure keyword matching misses (e.g. 'led a team' vs 'people management')."""
+    if sbert_score is not None:
+        return round(0.35 * kw_score + 0.20 * tfidf_score + 0.45 * sbert_score, 2)
+    return round(0.6 * kw_score + 0.4 * tfidf_score, 2)
+
+
 def fit_label(score):
     if score >= 70:
         return "Strong Fit", "You're well aligned with this role."
@@ -439,8 +515,10 @@ def extract_jd_keywords(jd_text_clean, top_n=18):
     return keywords
 
 
-def analyze_jd(cv_text_clean, jd_raw_text):
-    """Compare the CV directly against one specific job description."""
+def analyze_jd(cv_text_clean, jd_raw_text, cv_embedding=None):
+    """Compare the CV directly against one specific job description, blending
+    lexical keyword coverage with SBERT zero-shot semantic similarity between
+    the full CV and the full JD text."""
     jd_text_clean = clean_text(jd_raw_text)
     jd_keywords = extract_jd_keywords(jd_text_clean)
 
@@ -450,7 +528,13 @@ def analyze_jd(cv_text_clean, jd_raw_text):
         kw_score, matched, missing = 0.0, [], []
 
     tfidf_score = tfidf_similarity_score(cv_text_clean, jd_text_clean)
-    final_score = min(round(0.5 * kw_score + 0.5 * tfidf_score, 2), 100.0)
+
+    sbert_score = None
+    if cv_embedding is not None:
+        jd_embedding = sbert_embed(jd_text_clean)
+        sbert_score = sbert_similarity(cv_embedding, jd_embedding)
+
+    final_score = min(blend_scores(kw_score, tfidf_score, sbert_score), 100.0)
     label, subtext = fit_label(final_score)
     narrative = build_narrative("this specific role", final_score, matched, missing)
 
@@ -463,6 +547,7 @@ def analyze_jd(cv_text_clean, jd_raw_text):
         "final_score": final_score,
         "keyword_score": kw_score,
         "tfidf_score": tfidf_score,
+        "sbert_score": sbert_score,
         "fit_label": label,
         "fit_subtext": subtext,
         "narrative": narrative,
@@ -592,14 +677,20 @@ def build_radar(results, n=RADAR_AXES):
 
 def analyze_resume(cv_text):
     cv_text_clean = clean_text(cv_text)
+    cv_embedding = sbert_embed(cv_text_clean)  # None if SBERT unavailable — everything below handles that
     results = []
 
     for role, keywords in ROLE_PROFILES.items():
         role_text = clean_text(" ".join(keywords.keys()))
         kw_score, matched, missing = keyword_match_score(cv_text_clean, keywords)
         tfidf_score = tfidf_similarity_score(cv_text_clean, role_text)
-        final_score = round(0.6 * kw_score + 0.4 * tfidf_score, 2)
-        final_score = min(final_score, 100.0)
+
+        sbert_score = None
+        if cv_embedding is not None:
+            role_embedding = sbert_role_embedding(role, role_text)
+            sbert_score = sbert_similarity(cv_embedding, role_embedding)
+
+        final_score = min(blend_scores(kw_score, tfidf_score, sbert_score), 100.0)
         label, subtext = fit_label(final_score)
 
         card_offset = round(CARD_CIRC * (1 - final_score / 100), 2)
@@ -615,6 +706,7 @@ def analyze_resume(cv_text):
             "final_score": final_score,
             "keyword_score": kw_score,
             "tfidf_score": tfidf_score,
+            "sbert_score": sbert_score,
             "matched": matched,
             "missing": missing,
             "matched_names": [m[0] for m in matched],
@@ -632,7 +724,7 @@ def analyze_resume(cv_text):
         r["narrative"] = build_narrative(r["role"], r["final_score"], r["matched"], r["missing"])
 
     health = cv_health_checks(cv_text, cv_text_clean)
-    return results, health
+    return results, health, cv_embedding
 
 
 # ----------------------------------------------------------------------
@@ -892,6 +984,24 @@ RESULT_PAGE = """
   .badge.early{ background:rgba(224,85,111,.2); color:var(--danger); }
   .narrative{ color:var(--muted); font-size:14.5px; max-width:60ch; }
 
+  .score-breakdown{ display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .score-pill{
+    font-family:var(--font-mono); font-size:11px; padding:4px 10px; border-radius:999px;
+    border:1px solid var(--border); color:var(--muted);
+  }
+  .score-pill b{ color:var(--text); }
+  .score-pill.semantic{ border-color:var(--gold-soft); color:var(--gold); }
+  .score-pill.semantic b{ color:var(--gold); }
+
+  .sbert-note{
+    display:flex; align-items:center; gap:10px; font-size:13px; color:var(--muted);
+    background:var(--panel); border:1px solid var(--border); border-radius:10px;
+    padding:12px 16px; margin-bottom:32px;
+  }
+  .sbert-note .dot{ width:8px; height:8px; border-radius:50%; flex:0 0 auto; }
+  .sbert-note.on .dot{ background:var(--gold); }
+  .sbert-note.off .dot{ background:var(--muted); }
+
   h2.section{ font-family:var(--font-display); font-size:19px; margin:44px 0 4px; }
   p.section-desc{ color:var(--muted); font-size:13.5px; margin:0 0 16px; max-width:64ch; }
 
@@ -982,6 +1092,15 @@ RESULT_PAGE = """
 <div class="wrap">
   <p class="eyebrow">Diagnostic Report</p>
 
+  <div class="sbert-note {{ 'on' if sbert_active else 'off' }}">
+    <span class="dot"></span>
+    {% if sbert_active %}
+      Scores below blend lexical keyword matching with Sentence-BERT zero-shot semantic similarity (<code>{{ sbert_model }}</code>) — so paraphrased or synonym skills count too, not just exact keyword hits.
+    {% else %}
+      Semantic model (Sentence-BERT) unavailable on this run — falling back to lexical + TF-IDF scoring only. Results are still accurate, just keyword-driven.
+    {% endif %}
+  </div>
+
   {% set top = results[0] %}
   <div class="hero">
     <div class="gauge-wrap">
@@ -1000,6 +1119,11 @@ RESULT_PAGE = """
       <span class="badge {{ 'strong' if top.fit_label=='Strong Fit' else 'good' if top.fit_label=='Good Fit' else 'dev' if top.fit_label=='Developing Fit' else 'early' }}">{{ top.fit_label }}</span>
       <h1 class="hero-role">Best fit: {{ top.role }}</h1>
       <p class="narrative">{{ top.narrative }}</p>
+      <div class="score-breakdown">
+        <span class="score-pill">Lexical <b>{{ top.keyword_score | round(0) | int }}%</b></span>
+        <span class="score-pill">TF-IDF <b>{{ top.tfidf_score | round(0) | int }}%</b></span>
+        {% if top.sbert_score is not none %}<span class="score-pill semantic">Semantic (SBERT) <b>{{ top.sbert_score | round(0) | int }}%</b></span>{% endif %}
+      </div>
     </div>
   </div>
 
@@ -1015,6 +1139,11 @@ RESULT_PAGE = """
       <div style="flex:1; min-width:220px;">
         <span class="badge {{ 'strong' if jd.fit_label=='Strong Fit' else 'good' if jd.fit_label=='Good Fit' else 'dev' if jd.fit_label=='Developing Fit' else 'early' }}">{{ jd.fit_label }}</span>
         <p class="jd-narrative">{{ jd.narrative }}</p>
+        <div class="score-breakdown">
+          <span class="score-pill">Lexical <b>{{ jd.keyword_score | round(0) | int }}%</b></span>
+          <span class="score-pill">TF-IDF <b>{{ jd.tfidf_score | round(0) | int }}%</b></span>
+          {% if jd.sbert_score is not none %}<span class="score-pill semantic">Semantic (SBERT) <b>{{ jd.sbert_score | round(0) | int }}%</b></span>{% endif %}
+        </div>
       </div>
     </div>
     <div class="jd-chips">
@@ -1094,6 +1223,11 @@ RESULT_PAGE = """
           </div>
         </div>
       </summary>
+      <div class="score-breakdown">
+        <span class="score-pill">Lexical <b>{{ r.keyword_score | round(0) | int }}%</b></span>
+        <span class="score-pill">TF-IDF <b>{{ r.tfidf_score | round(0) | int }}%</b></span>
+        {% if r.sbert_score is not none %}<span class="score-pill semantic">Semantic <b>{{ r.sbert_score | round(0) | int }}%</b></span>{% endif %}
+      </div>
       <div class="chips">
         {% for m in r.matched_names[:6] %}<span class="chip-mini match">{{ m }}</span>{% endfor %}
         {% for m in r.missing_top[:5] %}<span class="chip-mini miss">{{ m.skill }}</span>{% endfor %}
@@ -1159,10 +1293,11 @@ def analyze():
                 except Exception:
                     jd_raw_text = ""
 
-    results, health = analyze_resume(cv_text)
+    results, health, cv_embedding = analyze_resume(cv_text)
     cv_text_clean = clean_text(cv_text)
+    sbert_active = cv_embedding is not None
 
-    jd_analysis = analyze_jd(cv_text_clean, jd_raw_text) if jd_raw_text else None
+    jd_analysis = analyze_jd(cv_text_clean, jd_raw_text, cv_embedding) if jd_raw_text else None
     roadmap = build_roadmap(results, jd_analysis)
     radar = build_radar(results)
 
@@ -1173,6 +1308,8 @@ def analyze():
         health=health,
         jd=jd_analysis,
         radar=radar,
+        sbert_active=sbert_active,
+        sbert_model=SBERT_MODEL_NAME,
         hero_circ=HERO_CIRC,
         card_circ=CARD_CIRC,
     )
