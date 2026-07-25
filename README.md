@@ -47,6 +47,19 @@ Then open **http://127.0.0.1:5000**.
 - Start command: `gunicorn app:app`
 - `sentence-transformers` pulls in PyTorch, which is a heavy dependency. On a memory-constrained free tier, the model may fail to download or load — if that happens, the app keeps working in lexical + TF-IDF mode automatically. If you'd rather not carry the extra weight at all, remove `sentence-transformers` from `requirements.txt`; no code changes needed.
 
+### Verifying SBERT status from the logs (no analysis needed)
+
+The app now logs its SBERT status explicitly, so you can check whether semantic scoring is active straight from the Render (or any host's) logs, without uploading a CV:
+
+- **At startup / import time** — one line, immediately:
+  - `[SBERT] Import OK — 'sentence_transformers' is installed. Model will be lazy-loaded on first analysis request.`
+  - or `[SBERT] Import FAILED — 'sentence_transformers' is not installed or could not be imported (...)`. This means the dependency itself never made it into the deployed environment — check the build log for whether `sentence-transformers`/`torch` actually installed.
+- **On first `/analyze` request that needs it** — the model loads lazily, so you'll see:
+  - `[SBERT] Loading model 'all-MiniLM-L6-v2' for the first time in this worker ...`
+  - then either `[SBERT] Model 'all-MiniLM-L6-v2' loaded successfully in X.Xs — semantic scoring is ACTIVE for this worker.`
+  - or `[SBERT] Model load FAILED after X.Xs — falling back to LEXICAL + TF-IDF scoring only ...` with a full traceback (common causes: OOM kill on a low-memory host, no network access to Hugging Face, disk space limits).
+- **Every `/analyze` request** also logs one line confirming which mode actually scored that request: `SEMANTIC (lexical + TF-IDF + SBERT)` or `FALLBACK (lexical + TF-IDF only)` — so you can correlate a specific upload with what ran, without needing to inspect the report's banner/pills in the browser.
+
 ## Project structure
 
 Everything lives in a single `app.py` for easy deployment:
