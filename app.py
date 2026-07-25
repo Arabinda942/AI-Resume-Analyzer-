@@ -1056,6 +1056,8 @@ RESULT_PAGE = """
   .score-pill b{ color:var(--text); }
   .score-pill.semantic{ border-color:var(--gold-soft); color:var(--gold); }
   .score-pill.semantic b{ color:var(--gold); }
+  .score-pill.semantic.unavailable{ border-color:var(--border); color:var(--muted); opacity:.65; }
+  .score-pill.semantic.unavailable b{ color:var(--muted); }
 
   .sbert-note{
     display:flex; align-items:center; gap:10px; font-size:13px; color:var(--muted);
@@ -1186,7 +1188,7 @@ RESULT_PAGE = """
       <div class="score-breakdown">
         <span class="score-pill">Lexical <b>{{ top.keyword_score | round(0) | int }}%</b></span>
         <span class="score-pill">TF-IDF <b>{{ top.tfidf_score | round(0) | int }}%</b></span>
-        {% if top.sbert_score is not none %}<span class="score-pill semantic">Semantic (SBERT) <b>{{ top.sbert_score | round(0) | int }}%</b></span>{% endif %}
+        {% if top.sbert_score is not none %}<span class="score-pill semantic">Semantic (SBERT) <b>{{ top.sbert_score | round(0) | int }}%</b></span>{% else %}<span class="score-pill semantic unavailable">Semantic (SBERT) <b>N/A</b></span>{% endif %}
       </div>
     </div>
   </div>
@@ -1206,7 +1208,7 @@ RESULT_PAGE = """
         <div class="score-breakdown">
           <span class="score-pill">Lexical <b>{{ jd.keyword_score | round(0) | int }}%</b></span>
           <span class="score-pill">TF-IDF <b>{{ jd.tfidf_score | round(0) | int }}%</b></span>
-          {% if jd.sbert_score is not none %}<span class="score-pill semantic">Semantic (SBERT) <b>{{ jd.sbert_score | round(0) | int }}%</b></span>{% endif %}
+          {% if jd.sbert_score is not none %}<span class="score-pill semantic">Semantic (SBERT) <b>{{ jd.sbert_score | round(0) | int }}%</b></span>{% else %}<span class="score-pill semantic unavailable">Semantic (SBERT) <b>N/A</b></span>{% endif %}
         </div>
       </div>
     </div>
@@ -1290,7 +1292,7 @@ RESULT_PAGE = """
       <div class="score-breakdown">
         <span class="score-pill">Lexical <b>{{ r.keyword_score | round(0) | int }}%</b></span>
         <span class="score-pill">TF-IDF <b>{{ r.tfidf_score | round(0) | int }}%</b></span>
-        {% if r.sbert_score is not none %}<span class="score-pill semantic">Semantic <b>{{ r.sbert_score | round(0) | int }}%</b></span>{% endif %}
+        {% if r.sbert_score is not none %}<span class="score-pill semantic">Semantic <b>{{ r.sbert_score | round(0) | int }}%</b></span>{% else %}<span class="score-pill semantic unavailable">Semantic <b>N/A</b></span>{% endif %}
       </div>
       <div class="chips">
         {% for m in r.matched_names[:6] %}<span class="chip-mini match">{{ m }}</span>{% endfor %}
